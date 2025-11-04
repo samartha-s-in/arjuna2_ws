@@ -17,7 +17,6 @@ setup(
     maintainer_email='work@newrro.in',
     description='TODO: Package description',
     license='TODO: License declaration',
-    tests_require=['pytest'],
     entry_points={
         'console_scripts': [
             'Publisher = arjuna_pub_sub.Publisher:main',

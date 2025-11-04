@@ -17,7 +17,6 @@ setup(
     maintainer_email='work@newrro.in',
     description='TODO: Package description',
     license='TODO: License declaration',
-    tests_require=['pytest'],
     entry_points={
         'console_scripts': [
             'Arjuna_cmd_vel_sub = motor_ops.Arjuna_cmd_vel_sub:main',

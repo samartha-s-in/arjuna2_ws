@@ -24,7 +24,6 @@ setup(
     maintainer_email='info@newrro.in',
     description='Arjuna autonomous robot ROS 2 package',
     license='MIT',
-    tests_require=['pytest'],
     entry_points={
         'console_scripts': [
             # Arduino scripts
