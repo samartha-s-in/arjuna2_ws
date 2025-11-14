@@ -1,0 +1,15 @@
+ekf_odom_pub:
+  ros__parameters:
+    # Robot physical parameters
+    ticks_per_revolution: 4095.0
+    wheel_radius: 0.04          # meters
+    wheel_base: 0.28            # meters
+    ticks_per_meter: 20475.0
+    
+    # Initial pose
+    initial_x: 0.0
+    initial_y: 0.0
+    initial_theta: 0.00000000001
+    
+    # Publishing rate (Hz)
+    publish_rate: 30.0

@@ -1,165 +1,151 @@
 #!/usr/bin/env python3
 
+"""
+Arjuna Camera Publisher - NO cv_bridge
+Uses pure Python for maximum compatibility
+"""
+
 import rclpy
 from rclpy.node import Node
-import depthai as dai
+from sensor_msgs.msg import CompressedImage
 import cv2
-import numpy as np
-from sensor_msgs.msg import Image
-from std_msgs.msg import Float32
+import threading
+from queue import Queue
+import time
 
-class CustomCvBridge:
-    """Custom cv_bridge for Python 3"""
-    def cv2_to_imgmsg(self, cv_image, encoding="bgr8"):
-        img_msg = Image()
-        img_msg.height = cv_image.shape[0]
-        img_msg.width = cv_image.shape[1]
-        img_msg.encoding = encoding
-        img_msg.is_bigendian = 0
-        
-        if encoding == "bgr8":
-            img_msg.step = cv_image.shape[1] * 3
-            img_msg.data = cv_image.tobytes()
-        elif encoding == "mono8":
-            img_msg.step = cv_image.shape[1]
-            img_msg.data = cv_image.tobytes()
-        
-        return img_msg
+# ==================== PARAMETERS ====================
+CAMERA_DEVICE = '/dev/video0'
+FRAME_WIDTH = 640
+FRAME_HEIGHT = 480
+FPS = 30
+JPEG_QUALITY = 80
+QUEUE_SIZE = 10
 
-class OAKPublisher(Node):
+class CameraPublisher(Node):
     def __init__(self):
-        super().__init__('oak_publisher')
+        super().__init__('arjuna_camera_publisher')
         
-        self.bridge = CustomCvBridge()
+        # Publisher
+        self.image_pub = self.create_publisher(
+            CompressedImage, 
+            '/arjuna/camera/image_raw/compressed', 
+            10)
         
-        # Publishers
-        self.frames_pub = self.create_publisher(Image, '/frames', 2)
-        self.depth_pub = self.create_publisher(Float32, '/oak/depth_value', 2)
+        # Stats
+        self.frame_count = 0
+        self.dropped_frames = 0
+        self.start_time = time.time()
         
-        # Setup OAK-D pipeline
-        self.pipeline = self.setup_oak_pipeline()
+        # Frame queue
+        self.frame_queue = Queue(maxsize=QUEUE_SIZE)
         
-        # Connect to device
-        self.device = dai.Device(self.pipeline)
-        self.get_logger().info("Connected to OAK-D camera")
+        # Open camera
+        self.cap = cv2.VideoCapture(CAMERA_DEVICE)
+        if not self.cap.isOpened():
+            self.get_logger().error("Failed to open camera!")
+            raise RuntimeError("Camera init failed")
         
-        # Output queues
-        self.q_rgb = self.device.getOutputQueue(name="rgb", maxSize=2, blocking=False)
-        self.q_depth = self.device.getOutputQueue(name="depth", maxSize=2, blocking=False)
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
+        self.cap.set(cv2.CAP_PROP_FPS, FPS)
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         
-        # Variables
-        self.min_depth = 100  # 10cm in mm
-        self.last_valid_depth = 0.0
+        # Start capture thread
+        self.is_capturing = True
+        self.capture_thread = threading.Thread(target=self.capture_loop, daemon=True)
+        self.capture_thread.start()
         
-        # Timer (30Hz)
-        self.timer = self.create_timer(1.0/30.0, self.publish_data)
+        # Publishing timer
+        timer_period = 1.0 / FPS
+        self.timer = self.create_timer(timer_period, self.publish_frame)
         
-    def setup_oak_pipeline(self):
-        """Setup OAK-D pipeline"""
-        pipeline = dai.Pipeline()
+        # Stats timer
+        self.stats_timer = self.create_timer(5.0, self.print_stats)
         
-        # RGB Camera
-        camRgb = pipeline.create(dai.node.ColorCamera)
-        xoutRgb = pipeline.create(dai.node.XLinkOut)
-        xoutRgb.setStreamName("rgb")
-        
-        camRgb.setBoardSocket(dai.CameraBoardSocket.RGB)
-        camRgb.setResolution(dai.ColorCameraProperties.SensorResolution.THE_1080_P)
-        camRgb.setInterleaved(False)
-        camRgb.setColorOrder(dai.ColorCameraProperties.ColorOrder.BGR)
-        camRgb.setVideoSize(640, 480)
-        camRgb.setFps(30)
-        
-        camRgb.video.link(xoutRgb.input)
-        
-        # Stereo depth
-        monoLeft = pipeline.create(dai.node.MonoCamera)
-        monoRight = pipeline.create(dai.node.MonoCamera)
-        stereo = pipeline.create(dai.node.StereoDepth)
-        xoutDepth = pipeline.create(dai.node.XLinkOut)
-        
-        xoutDepth.setStreamName("depth")
-        
-        monoLeft.setResolution(dai.MonoCameraProperties.SensorResolution.THE_400_P)
-        monoLeft.setBoardSocket(dai.CameraBoardSocket.LEFT)
-        monoLeft.setFps(30)
-        
-        monoRight.setResolution(dai.MonoCameraProperties.SensorResolution.THE_400_P)
-        monoRight.setBoardSocket(dai.CameraBoardSocket.RIGHT)
-        monoRight.setFps(30)
-        
-        stereo.setDefaultProfilePreset(dai.node.StereoDepth.PresetMode.HIGH_DENSITY)
-        stereo.setLeftRightCheck(True)
-        stereo.setExtendedDisparity(True)
-        
-        monoLeft.out.link(stereo.left)
-        monoRight.out.link(stereo.right)
-        stereo.depth.link(xoutDepth.input)
-        
-        return pipeline
-        
-    def publish_data(self):
-        """Publish camera and depth data"""
-        # Get RGB frame
-        in_rgb = self.q_rgb.tryGet()
-        
-        if in_rgb is not None:
-            rgb_frame = in_rgb.getCvFrame()
+        self.get_logger().info("=" * 60)
+        self.get_logger().info("ARJUNA CAMERA PUBLISHER - ACTIVE")
+        self.get_logger().info(f"Camera: /dev/video{CAMERA_DEVICE}")
+        self.get_logger().info(f"Resolution: {FRAME_WIDTH}x{FRAME_HEIGHT} @ {FPS} FPS")
+        self.get_logger().info(f"Topic: /arjuna/camera/image_raw/compressed")
+        self.get_logger().info("=" * 60)
+    
+    def capture_loop(self):
+        """Background capture thread"""
+        while self.is_capturing:
+            ret, frame = self.cap.read()
+            
+            if not ret:
+                self.get_logger().warn("Failed to capture")
+                time.sleep(0.01)
+                continue
+            
+            # Drop old frame if queue full
+            if self.frame_queue.full():
+                try:
+                    self.frame_queue.get_nowait()
+                    self.dropped_frames += 1
+                except:
+                    pass
             
             try:
-                ros_image = self.bridge.cv2_to_imgmsg(rgb_frame, "bgr8")
-                ros_image.header.stamp = self.get_clock().now().to_msg()
-                ros_image.header.frame_id = "oak_camera"
-                
-                self.frames_pub.publish(ros_image)
-                
-            except Exception as e:
-                self.get_logger().error(f"Error converting image: {e}")
+                self.frame_queue.put_nowait(frame)
+            except:
+                self.dropped_frames += 1
+    
+    def publish_frame(self):
+        """Publish frame from queue"""
+        if self.frame_queue.empty():
+            return
         
-        # Get depth data
-        in_depth = self.q_depth.tryGet()
+        try:
+            frame = self.frame_queue.get_nowait()
+        except:
+            return
         
-        if in_depth is not None:
-            depth_frame = in_depth.getFrame()
-            
-            h, w = depth_frame.shape
-            center_x, center_y = w // 2, h // 2
-            
-            center_depth = depth_frame[center_y, center_x]
-            
-            if center_depth < self.min_depth:
-                small_region = depth_frame[center_y-1:center_y+2, center_x-1:center_x+2]
-                valid_depths = small_region[small_region >= self.min_depth]
-                if valid_depths.size > 0:
-                    center_depth = float(np.median(valid_depths))
-            
-            if center_depth >= self.min_depth:
-                center_depth_cm = center_depth / 10.0
-                self.last_valid_depth = center_depth_cm
-                
-                depth_msg = Float32()
-                depth_msg.data = center_depth_cm
-                self.depth_pub.publish(depth_msg)
-            else:
-                if self.last_valid_depth > 0:
-                    depth_msg = Float32()
-                    depth_msg.data = self.last_valid_depth
-                    self.depth_pub.publish(depth_msg)
-                else:
-                    depth_msg = Float32()
-                    depth_msg.data = -1.0
-                    self.depth_pub.publish(depth_msg)
+        # Create message
+        msg = CompressedImage()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = 'camera_frame'
+        msg.format = 'jpeg'
+        
+        # Encode to JPEG (pure Python - no cv_bridge)
+        encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY]
+        success, encoded = cv2.imencode('.jpg', frame, encode_param)
+        
+        if success:
+            msg.data = encoded.tobytes()
+            self.image_pub.publish(msg)
+            self.frame_count += 1
+    
+    def print_stats(self):
+        """Stats output"""
+        elapsed = time.time() - self.start_time
+        fps = self.frame_count / elapsed if elapsed > 0 else 0
+        drop_pct = (self.dropped_frames / (self.frame_count + self.dropped_frames) * 100) if (self.frame_count + self.dropped_frames) > 0 else 0
+        
+        self.get_logger().info(
+            f"Frames: {self.frame_count} | Dropped: {self.dropped_frames} ({drop_pct:.1f}%) | "
+            f"FPS: {fps:.1f} | Queue: {self.frame_queue.qsize()}/{QUEUE_SIZE}"
+        )
+    
+    def cleanup(self):
+        self.is_capturing = False
+        if self.capture_thread:
+            self.capture_thread.join(timeout=2.0)
+        self.cap.release()
 
 def main(args=None):
     rclpy.init(args=args)
-    node = OAKPublisher()
     
     try:
-        rclpy.spin(node)
+        pub = CameraPublisher()
+        rclpy.spin(pub)
     except KeyboardInterrupt:
         pass
     finally:
-        node.destroy_node()
+        if 'pub' in locals():
+            pub.cleanup()
+            pub.destroy_node()
         rclpy.shutdown()
 
 if __name__ == '__main__':

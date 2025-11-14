@@ -38,17 +38,31 @@ class ObstacleAvoidance(Node):
         self.get_logger().info(f"Threshold: {OBSTACLE_DIST_THRESHOLD}m")
         
     def laser_callback(self, msg):
-        """Process LIDAR and take action"""
+        """Process LIDAR safely and take action"""
+        total_points = len(msg.ranges)
+        max_range = 10.0  # fallback distance
+        
+        def safe_min(start, end):
+            """Safely compute min over valid indices"""
+            if start >= total_points:
+                return max_range
+            end = min(end, total_points)
+            subset = msg.ranges[start:end]
+            valid_ranges = [r for r in subset if not (r == float('inf') or r == 0.0)]
+            return min(valid_ranges) if valid_ranges else max_range
+        
+        # Adjust these regions proportionally if needed
         self.regions = {
-            'front_L': min(min(msg.ranges[0:130]), 10.0),
-            'fleft': min(min(msg.ranges[131:230]), 10.0),
-            'left': min(min(msg.ranges[231:280]), 10.0),
-            'right': min(min(msg.ranges[571:620]), 10.0),
-            'fright': min(min(msg.ranges[621:720]), 10.0),
-            'front_R': min(min(msg.ranges[721:850]), 10.0)
+            'front_L': safe_min(0, int(total_points * 0.18)),
+            'fleft': safe_min(int(total_points * 0.18), int(total_points * 0.32)),
+            'left': safe_min(int(total_points * 0.32), int(total_points * 0.39)),
+            'right': safe_min(int(total_points * 0.79), int(total_points * 0.86)),
+            'fright': safe_min(int(total_points * 0.86), int(total_points * 1.0)),
+            'front_R': safe_min(int(total_points * 0.72), int(total_points * 0.85))
         }
         
         self.take_action()
+
         
     def is_path_clear(self):
         """Check if path is completely clear"""

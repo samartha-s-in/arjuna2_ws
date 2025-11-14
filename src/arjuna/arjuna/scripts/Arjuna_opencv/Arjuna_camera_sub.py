@@ -1,162 +1,149 @@
 #!/usr/bin/env python3
+
 """
-Camera Subscriber - Displays camera feed and depth information
+Arjuna Camera Subscriber - NO cv_bridge
+Uses pure Python for maximum compatibility
 """
 
 import rclpy
 from rclpy.node import Node
+from sensor_msgs.msg import CompressedImage
 import cv2
 import numpy as np
-from sensor_msgs.msg import Image
-from std_msgs.msg import Float32
+import threading
+from queue import Queue
+import time
 
-class CustomCvBridge:
-    """Custom cv_bridge replacement for Python 3 compatibility"""
-    
-    def imgmsg_to_cv2(self, img_msg, desired_encoding="passthrough"):
-        """Convert a ROS image message to an OpenCV image"""
-        if img_msg.encoding == "bgr8":
-            cv_image = np.frombuffer(img_msg.data, dtype=np.uint8).reshape(
-                img_msg.height, img_msg.width, 3
-            )
-        elif img_msg.encoding == "mono8":
-            cv_image = np.frombuffer(img_msg.data, dtype=np.uint8).reshape(
-                img_msg.height, img_msg.width
-            )
-        else:
-            raise ValueError(f"Unsupported encoding: {img_msg.encoding}")
-        
-        return cv_image
+WINDOW_NAME = "Arjuna Camera"
+QUEUE_SIZE = 5
+SHOW_FPS = True
 
-class CameraDisplay(Node):
+class CameraSubscriber(Node):
     def __init__(self):
-        super().__init__('camera_display')
+        super().__init__('arjuna_camera_subscriber')
         
-        # Custom CV bridge
-        self.bridge = CustomCvBridge()
-        
-        # Variables
-        self.rgb_frame = None
-        self.depth_value = 0.0
-        self.last_valid_depth = 0.0
+        # Stats
         self.frame_count = 0
-        self.start_time = self.get_clock().now()
-        self.fps = 0.0
-        self.text_color = (0, 255, 0)  # Default green
-        self.depth_text = "Depth: -- cm"
+        self.dropped_frames = 0
+        self.start_time = time.time()
+        self.last_frame_time = time.time()
+        self.current_fps = 0.0
         
-        # Subscribers
-        self.rgb_sub = self.create_subscription(
-            Image,
-            '/frames',
-            self.rgb_callback,
-            10
-        )
+        # Frame queue
+        self.frame_queue = Queue(maxsize=QUEUE_SIZE)
         
-        self.depth_sub = self.create_subscription(
-            Float32,
-            '/oak/depth_value',
-            self.depth_callback,
-            10
-        )
+        # Subscribe
+        self.image_sub = self.create_subscription(
+            CompressedImage,
+            '/arjuna/camera/image_raw/compressed',
+            self.image_callback,
+            10)
         
-        self.get_logger().info("===========================================")
-        self.get_logger().info("Camera Display Node Started")
-        self.get_logger().info("===========================================")
-        self.get_logger().info("Subscribing to: /frames, /oak/depth_value")
-        self.get_logger().info("Press 'q' in image window to quit")
+        # Display thread
+        self.is_displaying = True
+        self.display_thread = threading.Thread(target=self.display_loop, daemon=True)
+        self.display_thread.start()
         
-    def rgb_callback(self, msg):
-        """Process RGB image"""
+        # Stats timer
+        self.stats_timer = self.create_timer(5.0, self.print_stats)
+        
+        self.get_logger().info("=" * 60)
+        self.get_logger().info("ARJUNA CAMERA SUBSCRIBER - ACTIVE")
+        self.get_logger().info("Subscribed: /arjuna/camera/image_raw/compressed")
+        self.get_logger().info("Window: 'Arjuna Camera'")
+        self.get_logger().info("Press Q or ESC to quit")
+        self.get_logger().info("=" * 60)
+    
+    def image_callback(self, msg):
+        """Receive compressed image"""
         try:
-            # Convert ROS Image to OpenCV image
-            self.rgb_frame = self.bridge.imgmsg_to_cv2(msg, "bgr8")
+            # Decode JPEG (pure Python - no cv_bridge)
+            np_arr = np.frombuffer(msg.data, np.uint8)
+            frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
             
-            # Update FPS
-            self.frame_count += 1
-            current_time = self.get_clock().now()
-            elapsed = (current_time - self.start_time).nanoseconds / 1e9
+            if frame is None:
+                return
             
-            if elapsed > 1.0:
-                self.fps = self.frame_count / elapsed
-                self.frame_count = 0
-                self.start_time = current_time
+            # Calculate FPS
+            current_time = time.time()
+            time_diff = current_time - self.last_frame_time
+            if time_diff > 0:
+                self.current_fps = 1.0 / time_diff
+            self.last_frame_time = current_time
             
-            # Draw info on image
-            self.draw_info()
+            # Add FPS overlay
+            if SHOW_FPS:
+                cv2.putText(frame, f"FPS: {self.current_fps:.1f}", (10, 30),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
             
+            # Drop old if full
+            if self.frame_queue.full():
+                try:
+                    self.frame_queue.get_nowait()
+                    self.dropped_frames += 1
+                except:
+                    pass
+            
+            try:
+                self.frame_queue.put_nowait(frame)
+                self.frame_count += 1
+            except:
+                self.dropped_frames += 1
+                
         except Exception as e:
-            self.get_logger().error(f"Error processing RGB image: {e}")
+            self.get_logger().error(f"Decode error: {e}")
     
-    def depth_callback(self, msg):
-        """Process depth value"""
-        self.depth_value = msg.data
+    def display_loop(self):
+        """Display thread"""
+        cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
         
-        # Update text and color based on depth
-        if self.depth_value < 0:
-            self.depth_text = "Depth: Too close"
-            self.text_color = (0, 0, 255)  # Red
-        else:
-            self.depth_text = f"Depth: {self.depth_value:.1f} cm"
+        while self.is_displaying:
+            if not self.frame_queue.empty():
+                try:
+                    frame = self.frame_queue.get_nowait()
+                    cv2.imshow(WINDOW_NAME, frame)
+                except:
+                    pass
             
-            # Color based on distance
-            if self.depth_value < 30:
-                self.text_color = (0, 0, 255)  # Red - close
-            elif self.depth_value < 100:
-                self.text_color = (0, 255, 0)  # Green - medium
-            else:
-                self.text_color = (255, 255, 0)  # Cyan - far
-            
-            # Update last valid depth
-            self.last_valid_depth = self.depth_value
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q') or key == ord('Q') or key == 27:
+                self.is_displaying = False
+                break
+        
+        cv2.destroyAllWindows()
     
-    def draw_info(self):
-        """Draw information overlay on frame"""
-        if self.rgb_frame is None:
-            return
+    def print_stats(self):
+        """Stats output"""
+        elapsed = time.time() - self.start_time
+        fps = self.frame_count / elapsed if elapsed > 0 else 0
+        drop_pct = (self.dropped_frames / (self.frame_count + self.dropped_frames) * 100) if (self.frame_count + self.dropped_frames) > 0 else 0
         
-        # Create a copy
-        display_frame = self.rgb_frame.copy()
-        
-        # Create background rectangle for text
-        cv2.rectangle(display_frame, (10, 10), (300, 80), (0, 0, 0), -1)
-        
-        # Display depth text
-        cv2.putText(display_frame, self.depth_text, (15, 35), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 1.0, self.text_color, 2)
-        
-        # Display FPS
-        cv2.putText(display_frame, f"FPS: {self.fps:.1f}", (15, 70), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
-        
-        # Draw crosshair at center
-        h, w = display_frame.shape[:2]
-        center_x, center_y = w // 2, h // 2
-        cv2.line(display_frame, (center_x-20, center_y), (center_x+20, center_y), 
-                (0, 255, 255), 2)
-        cv2.line(display_frame, (center_x, center_y-20), (center_x, center_y+20), 
-                (0, 255, 255), 2)
-        cv2.circle(display_frame, (center_x, center_y), 5, (0, 255, 255), -1)
-        
-        # Show frame
-        cv2.imshow("OAK Camera Display", display_frame)
-        
-        # Check for quit
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            self.get_logger().info("Quit signal received")
-            rclpy.shutdown()
+        self.get_logger().info(
+            f"Frames: {self.frame_count} | Dropped: {self.dropped_frames} ({drop_pct:.1f}%) | "
+            f"FPS: {fps:.1f} | Queue: {self.frame_queue.qsize()}/{QUEUE_SIZE}"
+        )
+    
+    def cleanup(self):
+        self.is_displaying = False
+        if self.display_thread:
+            self.display_thread.join(timeout=2.0)
+        cv2.destroyAllWindows()
 
 def main(args=None):
     rclpy.init(args=args)
-    node = CameraDisplay()
     
     try:
-        rclpy.spin(node)
+        sub = CameraSubscriber()
+        
+        while sub.is_displaying and rclpy.ok():
+            rclpy.spin_once(sub, timeout_sec=0.1)
+            
     except KeyboardInterrupt:
         pass
     finally:
-        cv2.destroyAllWindows()
-        node.destroy_node()
+        if 'sub' in locals():
+            sub.cleanup()
+            sub.destroy_node()
         rclpy.shutdown()
 
 if __name__ == '__main__':

@@ -1,263 +1,273 @@
 #!/usr/bin/env python3
 
+"""
+Arjuna QR Tracking
+Detects QR code with "Arjuna" text, displays zones, publishes tracking commands
+
+Company: NEWRRO TECH LLP
+Website: www.newrro.in
+"""
+
 import rclpy
 from rclpy.node import Node
+from sensor_msgs.msg import CompressedImage
+from std_msgs.msg import String
 import cv2
-import depthai as dai
-from pyzbar.pyzbar import decode
-from sensor_msgs.msg import LaserScan
-from geometry_msgs.msg import Twist
-from std_msgs.msg import Int8
+import numpy as np
+from pyzbar import pyzbar
+import threading
+from queue import Queue
+import time
 
-# Motion parameters
-LINEAR_VELOCITY = 0.15
-ANGULAR_VELOCITY = 0.7
+# ==================== PARAMETERS ====================
+WINDOW_NAME = "Arjuna QR Tracking"
+TARGET_QR_TEXT = "Arjuna"  # Case sensitive
+ZONE_LEFT_PERCENT = 40     # Left zone: 0-40%
+ZONE_CENTER_PERCENT = 20   # Center zone: 40-60%
+ZONE_RIGHT_PERCENT = 40    # Right zone: 60-100%
 
-class QRTracking(Node):
+# Colors (BGR format)
+COLOR_GREEN = (0, 255, 0)
+COLOR_RED = (0, 0, 255)
+COLOR_BLUE = (255, 0, 0)
+COLOR_YELLOW = (0, 255, 255)
+COLOR_WHITE = (255, 255, 255)
+
+class QRTracker(Node):
     def __init__(self):
-        super().__init__('qr_tracking')
+        super().__init__('arjuna_qr_tracker')
         
-        # QR tracking variables
-        self.turn_right = 0
-        self.turn_left = 0
-        self.straight = 0
+        # State
+        self.current_frame = None
+        self.qr_detected = False
+        self.qr_zone = None  # 'left', 'center', 'right'
+        self.qr_data = None
+        self.qr_bbox = None
         
-        # LIDAR regions
-        self.regions = {}
+        # Statistics
+        self.frame_count = 0
+        self.qr_count = 0
+        self.start_time = time.time()
         
-        # Publishers
-        self.cmd_pub = self.create_publisher(Twist, '/cmd_vel', 10)
-        self.right_pub = self.create_publisher(Int8, 'turn_right', 10)
-        self.left_pub = self.create_publisher(Int8, 'turn_left', 10)
-        self.straight_pub = self.create_publisher(Int8, 'straight', 10)
+        # Frame queue for display
+        self.frame_queue = Queue(maxsize=2)
         
-        # Subscriber
-        self.laser_sub = self.create_subscription(
-            LaserScan,
-            '/scan',
-            self.laser_callback,
-            10
-        )
+        # Subscribe to camera
+        self.image_sub = self.create_subscription(
+            CompressedImage,
+            '/arjuna/camera/image_raw/compressed',
+            self.image_callback,
+            10)
         
-        # Setup OAK-D camera
-        self.pipeline = self.setup_oak_pipeline()
-        self.device = dai.Device(self.pipeline)
-        self.q_rgb = self.device.getOutputQueue(name="rgb", maxSize=4, blocking=False)
+        # Publish QR tracking command
+        self.qr_cmd_pub = self.create_publisher(
+            String,
+            '/arjuna/qr_tracking/command',
+            10)
         
-        self.get_logger().info("QR Tracking Node Started")
+        # Display thread
+        self.is_displaying = True
+        self.display_thread = threading.Thread(target=self.display_loop, daemon=True)
+        self.display_thread.start()
         
-        # Timer for processing
-        self.timer = self.create_timer(0.1, self.process_frame)
+        # Stats timer
+        self.stats_timer = self.create_timer(5.0, self.print_stats)
         
-    def setup_oak_pipeline(self):
-        """Setup OAK-D pipeline"""
-        pipeline = dai.Pipeline()
-        
-        camRgb = pipeline.create(dai.node.ColorCamera)
-        xoutRgb = pipeline.create(dai.node.XLinkOut)
-        xoutRgb.setStreamName("rgb")
-        
-        camRgb.setBoardSocket(dai.CameraBoardSocket.RGB)
-        camRgb.setResolution(dai.ColorCameraProperties.SensorResolution.THE_1080_P)
-        camRgb.setInterleaved(False)
-        camRgb.setColorOrder(dai.ColorCameraProperties.ColorOrder.BGR)
-        camRgb.setFps(30)
-        camRgb.setPreviewSize(640, 480)
-        
-        camRgb.preview.link(xoutRgb.input)
-        
-        return pipeline
-        
-    def laser_callback(self, msg):
-        """Process LIDAR data"""
-        self.regions = {
-            'front_L': min(min(msg.ranges[0:130]), 10.0),
-            'fleft': min(min(msg.ranges[131:230]), 10.0),
-            'left': min(min(msg.ranges[231:280]), 10.0),
-            'right': min(min(msg.ranges[571:620]), 10.0),
-            'fright': min(min(msg.ranges[621:720]), 10.0),
-            'front_R': min(min(msg.ranges[721:850]), 10.0)
-        }
-        
-    def preprocess_image(self, frame):
-        """Preprocess for better QR detection"""
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-        adaptive_thresh = cv2.adaptiveThreshold(
-            blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
-            cv2.THRESH_BINARY, 11, 2
-        )
-        return adaptive_thresh
-        
-    def process_frame(self):
-        """Process camera frame for QR tracking"""
-        in_rgb = self.q_rgb.tryGet()
-        
-        if in_rgb is None:
-            return
+        self.get_logger().info("")
+        self.get_logger().info("=" * 60)
+        self.get_logger().info("ARJUNA QR TRACKING - ACTIVE")
+        self.get_logger().info("=" * 60)
+        self.get_logger().info(f"Target QR: '{TARGET_QR_TEXT}' (case sensitive)")
+        self.get_logger().info(f"Zones: LEFT {ZONE_LEFT_PERCENT}% | CENTER {ZONE_CENTER_PERCENT}% | RIGHT {ZONE_RIGHT_PERCENT}%")
+        self.get_logger().info("Subscribes: /arjuna/camera/image_raw/compressed")
+        self.get_logger().info("Publishes: /arjuna/qr_tracking/command")
+        self.get_logger().info("=" * 60)
+        self.get_logger().info("Window: Green box = centered | Red box = need alignment")
+        self.get_logger().info("Press Q or ESC to quit")
+        self.get_logger().info("=" * 60)
+        self.get_logger().info("")
+    
+    def image_callback(self, msg):
+        """Process incoming camera frames"""
+        try:
+            # Decode JPEG
+            np_arr = np.frombuffer(msg.data, np.uint8)
+            frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
             
-        frame = in_rgb.getCvFrame()
-        
-        if frame is None:
-            return
+            if frame is None:
+                return
             
-        rows, columns, _ = frame.shape
-        y_tolerance_1 = int(columns / 2.3)
-        y_tolerance_2 = int(columns / 1.71)
-        
-        # Draw tolerance lines
-        cv2.line(frame, (y_tolerance_2, 0), (y_tolerance_2, 480), (255, 0, 0), 1)
-        cv2.line(frame, (y_tolerance_1, 0), (y_tolerance_1, 480), (255, 0, 0), 1)
-        
-        # Try direct decoding
-        decoded_image = decode(frame)
-        
-        # If no QR codes, try preprocessing
-        if not decoded_image:
-            processed_frame = self.preprocess_image(frame)
-            decoded_image = decode(processed_frame)
-        
-        qr_detected = False
-        
-        # Reset control flags
-        self.turn_right = 0
-        self.turn_left = 0
-        self.straight = 0
-        
-        # Process QR codes
-        for barcode in decoded_image:
-            qr_detected = True
-            string_data = barcode.data.decode("utf-8")
+            self.frame_count += 1
             
-            if string_data == "Arjuna":
-                x, y, w, h = barcode.rect
-                y_medium = int(x + w / 2)
+            # Process frame for QR detection
+            self.process_frame(frame)
+            
+        except Exception as e:
+            self.get_logger().error(f"Frame processing error: {e}")
+    
+    def process_frame(self, frame):
+        """Detect QR codes and determine zone"""
+        height, width = frame.shape[:2]
+        
+        # Calculate zone boundaries
+        left_boundary = int(width * ZONE_LEFT_PERCENT / 100)
+        right_boundary = int(width * (ZONE_LEFT_PERCENT + ZONE_CENTER_PERCENT) / 100)
+        
+        # Draw zone partition lines
+        cv2.line(frame, (left_boundary, 0), (left_boundary, height), COLOR_YELLOW, 2)
+        cv2.line(frame, (right_boundary, 0), (right_boundary, height), COLOR_YELLOW, 2)
+        
+        # Add zone labels
+        cv2.putText(frame, "LEFT", (int(left_boundary/2) - 30, 30),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, COLOR_YELLOW, 2)
+        cv2.putText(frame, "CENTER", (left_boundary + int((right_boundary - left_boundary)/2) - 40, 30),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, COLOR_YELLOW, 2)
+        cv2.putText(frame, "RIGHT", (right_boundary + int((width - right_boundary)/2) - 35, 30),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, COLOR_YELLOW, 2)
+        
+        # Detect QR codes
+        qr_codes = pyzbar.decode(frame)
+        
+        # Reset detection state
+        self.qr_detected = False
+        self.qr_zone = None
+        command = "stop"
+        
+        # Process detected QR codes
+        for qr in qr_codes:
+            qr_data = qr.data.decode('utf-8')
+            
+            # Only process QR with target text (case sensitive)
+            if qr_data == TARGET_QR_TEXT:
+                self.qr_detected = True
+                self.qr_data = qr_data
+                self.qr_count += 1
                 
-                # Draw green rectangle
-                cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 3)
-                cv2.line(frame, (y_medium, 0), (y_medium, 480), (0, 0, 255), 1)
-                
-                # Determine movement
-                if y_medium > y_tolerance_2:
-                    self.turn_right = 1
-                    msg = Int8()
-                    msg.data = 1
-                    self.right_pub.publish(msg)
+                # Get QR bounding box
+                points = qr.polygon
+                if len(points) == 4:
+                    # Calculate center of QR code
+                    qr_center_x = int(sum([p.x for p in points]) / 4)
                     
-                    msg.data = 0
-                    self.left_pub.publish(msg)
-                    self.straight_pub.publish(msg)
+                    # Determine which zone QR is in
+                    if qr_center_x < left_boundary:
+                        self.qr_zone = "left"
+                        box_color = COLOR_RED
+                        command = "left"
+                    elif qr_center_x < right_boundary:
+                        self.qr_zone = "center"
+                        box_color = COLOR_GREEN
+                        command = "center"
+                    else:
+                        self.qr_zone = "right"
+                        box_color = COLOR_RED
+                        command = "right"
                     
-                    cv2.putText(frame, "Turning Right", (10, 30),
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                    # Draw bounding box
+                    pts = np.array([[p.x, p.y] for p in points], np.int32)
+                    pts = pts.reshape((-1, 1, 2))
+                    cv2.polylines(frame, [pts], True, box_color, 3)
                     
-                elif y_medium < y_tolerance_1:
-                    self.turn_left = 1
-                    msg = Int8()
-                    msg.data = 1
-                    self.left_pub.publish(msg)
+                    # Draw center point
+                    cv2.circle(frame, (qr_center_x, int(sum([p.y for p in points]) / 4)), 
+                             5, box_color, -1)
                     
-                    msg.data = 0
-                    self.right_pub.publish(msg)
-                    self.straight_pub.publish(msg)
+                    # Display QR data and zone
+                    text_y = int(sum([p.y for p in points]) / 4) - 20
+                    cv2.putText(frame, f"QR: {qr_data}", 
+                              (qr_center_x - 50, text_y),
+                              cv2.FONT_HERSHEY_SIMPLEX, 0.6, box_color, 2)
+                    cv2.putText(frame, f"Zone: {self.qr_zone.upper()}", 
+                              (qr_center_x - 50, text_y + 25),
+                              cv2.FONT_HERSHEY_SIMPLEX, 0.6, box_color, 2)
                     
-                    cv2.putText(frame, "Turning Left", (10, 30),
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-                    
-                else:
-                    self.straight = 1
-                    msg = Int8()
-                    msg.data = 1
-                    self.straight_pub.publish(msg)
-                    
-                    msg.data = 0
-                    self.left_pub.publish(msg)
-                    self.right_pub.publish(msg)
-                    
-                    cv2.putText(frame, "Moving Straight", (10, 30),
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                    # Only process first matching QR
+                    break
         
-        if not qr_detected:
-            cv2.putText(frame, "NO QR RECOGNISED", (10, 30),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+        # Publish tracking command
+        cmd_msg = String()
+        cmd_msg.data = command
+        self.qr_cmd_pub.publish(cmd_msg)
+        
+        # Add status info at bottom
+        status_text = f"Status: {'QR DETECTED' if self.qr_detected else 'NO QR'} | Command: {command.upper()}"
+        status_color = COLOR_GREEN if self.qr_detected else COLOR_RED
+        cv2.putText(frame, status_text, (10, height - 20),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, status_color, 2)
+        
+        # Add FPS
+        elapsed = time.time() - self.start_time
+        fps = self.frame_count / elapsed if elapsed > 0 else 0
+        cv2.putText(frame, f"FPS: {fps:.1f}", (10, height - 50),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, COLOR_WHITE, 2)
+        
+        # Add to display queue
+        if self.frame_queue.full():
+            try:
+                self.frame_queue.get_nowait()
+            except:
+                pass
+        
+        try:
+            self.frame_queue.put_nowait(frame)
+        except:
+            pass
+    
+    def display_loop(self):
+        """Display processed frames"""
+        cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
+        
+        while self.is_displaying:
+            if not self.frame_queue.empty():
+                try:
+                    frame = self.frame_queue.get_nowait()
+                    cv2.imshow(WINDOW_NAME, frame)
+                except:
+                    pass
             
-            msg = Int8()
-            msg.data = 0
-            self.right_pub.publish(msg)
-            self.left_pub.publish(msg)
-            self.straight_pub.publish(msg)
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q') or key == ord('Q') or key == 27:
+                self.get_logger().info("Quit key pressed")
+                self.is_displaying = False
+                break
         
-        # Execute movement based on LIDAR and QR detection
-        if self.regions:
-            if self.regions['front_L'] > 0.30 and self.regions['front_R'] > 0.30:
-                if self.turn_right == 1:
-                    self.turn_right_velo()
-                    cv2.putText(frame, "Movement: Right", (10, 60),
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
-                elif self.turn_left == 1:
-                    self.turn_left_velo()
-                    cv2.putText(frame, "Movement: Left", (10, 60),
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
-                elif self.straight == 1:
-                    self.move_straight_velo()
-                    cv2.putText(frame, "Movement: Straight", (10, 60),
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
-                else:
-                    self.stop()
-                    cv2.putText(frame, "Movement: Stop", (10, 60),
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-            else:
-                self.stop()
-                cv2.putText(frame, "OBSTACLE DETECTED", (10, 60),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+        cv2.destroyAllWindows()
+    
+    def print_stats(self):
+        """Print statistics"""
+        elapsed = time.time() - self.start_time
+        fps = self.frame_count / elapsed if elapsed > 0 else 0
         
-        # Display LIDAR info
-        if self.regions:
-            cv2.putText(frame, f"Front L: {self.regions['front_L']:.2f}m", 
-                       (columns-200, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-            cv2.putText(frame, f"Front R: {self.regions['front_R']:.2f}m",
-                       (columns-200, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-        
-        cv2.imshow("QR Tracking", frame)
-        cv2.waitKey(1)
-        
-    def turn_left_velo(self):
-        """Turn left"""
-        twist_msg = Twist()
-        twist_msg.angular.z = ANGULAR_VELOCITY
-        self.cmd_pub.publish(twist_msg)
-        
-    def turn_right_velo(self):
-        """Turn right"""
-        twist_msg = Twist()
-        twist_msg.angular.z = -ANGULAR_VELOCITY
-        self.cmd_pub.publish(twist_msg)
-        
-    def move_straight_velo(self):
-        """Move straight"""
-        twist_msg = Twist()
-        twist_msg.linear.x = LINEAR_VELOCITY
-        twist_msg.angular.z = 0.0
-        self.cmd_pub.publish(twist_msg)
-        
-    def stop(self):
-        """Stop robot"""
-        twist_msg = Twist()
-        twist_msg.linear.x = 0.0
-        twist_msg.angular.z = 0.0
-        self.cmd_pub.publish(twist_msg)
+        self.get_logger().info(
+            f"Stats | Frames: {self.frame_count} | QR Detections: {self.qr_count} | "
+            f"FPS: {fps:.1f} | Current: {'QR=' + self.qr_zone.upper() if self.qr_detected else 'NO QR'}"
+        )
+    
+    def cleanup(self):
+        """Cleanup resources"""
+        self.is_displaying = False
+        if self.display_thread:
+            self.display_thread.join(timeout=2.0)
+        cv2.destroyAllWindows()
+        self.get_logger().info("QR Tracker cleaned up")
 
 def main(args=None):
     rclpy.init(args=args)
-    node = QRTracking()
     
     try:
-        rclpy.spin(node)
+        tracker = QRTracker()
+        
+        while tracker.is_displaying and rclpy.ok():
+            rclpy.spin_once(tracker, timeout_sec=0.1)
+            
     except KeyboardInterrupt:
         pass
+    except Exception as e:
+        print(f"Error: {e}")
     finally:
-        cv2.destroyAllWindows()
-        node.destroy_node()
+        if 'tracker' in locals():
+            tracker.cleanup()
+            tracker.destroy_node()
         rclpy.shutdown()
 
 if __name__ == '__main__':

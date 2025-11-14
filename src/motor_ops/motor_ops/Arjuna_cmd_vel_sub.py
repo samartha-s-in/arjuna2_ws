@@ -12,7 +12,7 @@ Left_velocity = 0
 Right_velocity = 0
 
 BAUDRATE = 115200
-DEVICENAME = '/dev/ttyUSB1'
+DEVICENAME = '/dev/ttyUSB2'
 MOTOR_ACCL = 0
 
 portHandler = PortHandler(DEVICENAME)
